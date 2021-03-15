@@ -1,5 +1,9 @@
 defmodule Kousa.Gen.UserSession do
   use GenServer
+  alias Kousa.Gen
+  alias Kousa.RegUtils
+  alias Kousa.BL
+  # alias Beef.Users
 
   defmodule State do
     @type t :: %__MODULE__{
@@ -8,8 +12,7 @@ defmodule Kousa.Gen.UserSession do
             display_name: String.t(),
             current_room_id: String.t(),
             muted: boolean(),
-            pid: pid(),
-            atomic_op: String.t()
+            pid: pid()
           }
 
     defstruct user_id: nil,
@@ -17,8 +20,7 @@ defmodule Kousa.Gen.UserSession do
               muted: false,
               pid: nil,
               display_name: nil,
-              avatar_url: nil,
-              atomic_op: nil
+              avatar_url: nil
   end
 
   def start_link(%State{
@@ -36,8 +38,7 @@ defmodule Kousa.Gen.UserSession do
         pid: nil,
         user_id: user_id,
         current_room_id: current_room_id,
-        muted: Kousa.Caster.bool(muted),
-        atomic_op: nil
+        muted: Kousa.Caster.bool(muted)
       },
       name: :"#{user_id}:user_session"
     )
@@ -78,6 +79,10 @@ defmodule Kousa.Gen.UserSession do
     end
   end
 
+  def handle_cast({:set, key, value}, state) do
+    {:noreply, Map.put(state, key, value)}
+  end
+
   def handle_cast({:send_ws_msg, _platform, msg}, state) do
     if not is_nil(state.pid) do
       send(state.pid, {:remote_send, msg})
@@ -108,10 +113,6 @@ defmodule Kousa.Gen.UserSession do
     {:noreply, state}
   end
 
-  def handle_cast({:done_with_atomic_op}, state) do
-    {:noreply, %{state | atomic_op: nil}}
-  end
-
   def handle_cast({:set_current_room_id, current_room_id}, state) do
     {:noreply, %{state | current_room_id: current_room_id}}
   end
@@ -128,29 +129,27 @@ defmodule Kousa.Gen.UserSession do
     {:reply, Map.get(state, key), state}
   end
 
-  def handle_call({:start_atomic_op, op}, _, state) do
-    if is_nil(state.atomic_op) do
-      {:reply, :ok, %{state | atomic_op: op}}
-    else
-      {:reply, :err, state}
-    end
-  end
-
   def handle_call({:set_pid, pid}, _, state) do
     if not is_nil(state.pid) do
       send(state.pid, {:kill})
     else
-      Kousa.Data.User.set_online(state.user_id)
+      Beef.Users.set_online(state.user_id)
     end
 
     Process.monitor(pid)
     {:reply, :ok, %{state | pid: pid}}
   end
 
-  def handle_info({:reconnect_to_voice_server}, state) do
-    if not is_nil(state.pid) do
-      if not is_nil(state.current_room_id) do
-        Kousa.BL.Room.join_vc_room(state.user_id, state.current_room_id)
+  def handle_info({:reconnect_to_voice_server, voice_server_id}, %State{} = state) do
+    if not is_nil(state.pid) and not is_nil(state.current_room_id) do
+      with {:ok, ^voice_server_id} <-
+             RegUtils.lookup_and_call(
+               Gen.RoomSession,
+               state.current_room_id,
+               {:get_voice_server_id}
+             ) do
+        room = Rooms.get_room_by_id(state.current_room_id)
+        BL.Room.join_vc_room(state.user_id, room)
       end
     end
 
@@ -159,7 +158,7 @@ defmodule Kousa.Gen.UserSession do
 
   def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
     if state.pid === pid do
-      Kousa.Data.User.set_offline(state.user_id)
+      Beef.Users.set_offline(state.user_id)
 
       if state.current_room_id do
         Kousa.BL.Room.leave_room(state.user_id, state.current_room_id)
